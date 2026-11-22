@@ -1,0 +1,31 @@
+{
+  "id": "zapret",
+  "name": "Zapret (обход DPI)",
+  "version": "1.0.0",
+  "description": "Устанавливает zapret2 (обход DPI-блокировок YouTube, Discord и др.) прямо на Станцию и включает/выключает его по команде или из панели. Требует root и интернет с колонки.",
+  "author": "Moby812",
+  "kind": "rust",
+  "arch": "arm64",
+  "api": 1,
+  "category": "system",
+  "icon": "network",
+  "main": "zapret-plugin",
+  "provides": ["tools", "commands"],
+  "min_core": "0.10.0",
+  "settings": [
+    {
+      "key": "enabled",
+      "label": "Обход включён",
+      "type": "bool",
+      "default": false,
+      "hint": "Включить/выключить обход DPI на колонке. При первом включении плагин установит zapret2."
+    },
+    {
+      "key": "base",
+      "label": "Каталог zapret2",
+      "type": "text",
+      "default": "/data/opt/zapret2",
+      "hint": "Куда плагин установит zapret2."
+    }
+  ]
+}

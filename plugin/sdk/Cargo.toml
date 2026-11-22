@@ -1,0 +1,17 @@
+[package]
+name = "jarvis-plugin-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Триммированная, самодостаточная копия `jarvis-plugin-sdk` из YaJarvis
+# (https://github.com/newfpv/YaJarvis). Убран модуль `rpc` (для официальных
+# пакетов он не нужен) и зависимости, которые тянулись через workspace.
+# Используется только feature `process` для standalone Rust-плагинов.
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", default-features = false, features = ["rt", "io-std", "io-util", "macros"], optional = true }
+
+[features]
+process = ["dep:tokio"]

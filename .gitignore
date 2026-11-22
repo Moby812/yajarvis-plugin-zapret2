@@ -1,0 +1,10 @@
+# Rust-сборка плагина
+plugin/target/
+plugin/dist/
+jarvis-plugin-arm64.zip
+jarvis-plugin-armv7.zip
+
+# IDE / ОС
+.idea/
+*.iml
+.DS_Store
