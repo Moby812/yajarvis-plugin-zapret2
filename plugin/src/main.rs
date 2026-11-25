@@ -25,6 +25,10 @@ use tokio::process::Command;
 
 /// Каталог, куда install.sh ставит zapret2 (переопределяется настройкой `base`).
 const DEFAULT_BASE: &str = "/data/opt/zapret2";
+/// Ядро YaJarvis запускает Rust-плагины с очищенным окружением (`env_clear()`),
+/// поэтому задаём стандартный PATH колонки (включая Entware /opt).
+const DEFAULT_PATH: &str =
+    "/opt/sbin:/opt/bin:/data/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Имя панельной настройки-тумблера.
 const SETTING_ENABLED: &str = "enabled";
 /// Имя процесса демона nfqws2 (для проверки, что обход реально запущен).
@@ -38,14 +42,31 @@ const UNINSTALL_SH: &str = include_str!("../../files/uninstall.sh");
 const HOSTS_TXT: &str = include_str!("../../files/hosts.txt");
 const S99_ZAPRET2: &str = include_str!("../../files/S99zapret2");
 
+fn effective_path() -> String {
+    std::env::var("PATH")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PATH.to_string())
+}
+
+fn parse_base(settings: &serde_json::Map<String, Value>) -> PathBuf {
+    settings
+        .get("base")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_BASE))
+}
+
 struct State {
     enabled: bool,
+    base: PathBuf,
 }
 
 #[derive(Clone)]
 struct Zapret {
     state: Arc<Mutex<State>>,
-    base: PathBuf,
     work_dir: PathBuf,
 }
 
@@ -55,18 +76,12 @@ impl Zapret {
             .get(SETTING_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let base = settings
-            .get("base")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_BASE));
+        let base = parse_base(settings);
         // Рабочий каталог процесса (данные плагина). Сюда кладём временные
         // скрипты установки.
         let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
         Zapret {
-            state: Arc::new(Mutex::new(State { enabled })),
-            base,
+            state: Arc::new(Mutex::new(State { enabled, base })),
             work_dir,
         }
     }
@@ -75,13 +90,17 @@ impl Zapret {
         self.state.lock().unwrap().enabled
     }
 
+    fn base(&self) -> PathBuf {
+        self.state.lock().unwrap().base.clone()
+    }
+
     fn set_enabled(&self, v: bool) {
         let mut st = self.state.lock().unwrap();
         st.enabled = v;
     }
 
     fn is_installed(&self) -> bool {
-        self.base.join("start.sh").is_file()
+        self.base().join("start.sh").is_file()
     }
 
     /// Материализует встроенные скрипты в подкаталог работы плагина.
@@ -109,10 +128,11 @@ impl Zapret {
     /// BusyBox на Станции может не иметь `pgrep`, поэтому пробуем по очереди
     /// `pgrep -x`, `pidof`, а в конце — сверить PID из pid-файла с /proc.
     async fn is_running(&self) -> bool {
+        let path = effective_path();
         // 1) pgrep
-        let out = Command::new("pgrep")
-            .arg("-x")
-            .arg(NFPROC)
+        let out = Command::new("/bin/sh")
+            .args(["-c", "pgrep -x \"$1\" >/dev/null 2>&1 || pidof \"$1\" >/dev/null 2>&1", "--", NFPROC])
+            .env("PATH", &path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
@@ -122,20 +142,8 @@ impl Zapret {
                 return true;
             }
         }
-        // 2) pidof
-        let out = Command::new("pidof")
-            .arg(NFPROC)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await;
-        if let Ok(o) = out {
-            if o.status.success() {
-                return true;
-            }
-        }
-        // 3) PID из pid-файла, живой ли он в /proc.
-        let pid_file = self.base.join("nfqws2.pid");
+        // 2) PID из pid-файла, живой ли он в /proc.
+        let pid_file = self.base().join("nfqws2.pid");
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
             let pid = pid.trim();
             if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
@@ -152,28 +160,33 @@ impl Zapret {
         script: &Path,
         env: &[(&str, &str)],
     ) -> Result<String, String> {
-        // Не чистим окружение: install.sh/start.sh полагаются на PATH (iptables,
-        // ip, curl) и LD_LIBRARY_PATH для Entware. Просто добавляем свои
-        // переменные (BASE и т.п.) поверх унаследованного окружения.
-        let out = Command::new("sh")
+        let path = effective_path();
+        let out = Command::new("/bin/sh")
             .arg(script)
             .current_dir(&self.work_dir)
+            .env("PATH", &path)
             .envs(env.iter().copied())
             .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| format!("не удалось запустить {}: {}", script.display(), e))?;
-        let mut msg = if out.status.success() {
-            "OK".to_string()
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        if out.status.success() {
+            Ok(if detail.is_empty() {
+                "OK".to_string()
+            } else {
+                format!("OK: {detail}")
+            })
         } else {
-            format!("ошибка (exit {})", out.status.code().unwrap_or(-1))
-        };
-        let log = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !log.is_empty() {
-            msg.push_str(": ");
-            msg.push_str(&log);
+            let mut msg = format!("ошибка (exit {})", out.status.code().unwrap_or(-1));
+            if !detail.is_empty() {
+                msg.push_str(": ");
+                msg.push_str(&detail);
+            }
+            Err(msg)
         }
-        Ok(msg)
     }
 
     /// Полная установка zapret2, если его ещё нет.
@@ -184,21 +197,20 @@ impl Zapret {
         let src = self.materialize_scripts()?;
         eprintln!("[zapret] установка из {}", src.display());
         let install_script = src.join("install.sh");
-        let base = self.base.display().to_string();
+        let base = self.base().display().to_string();
         // install.sh сам читает config-файлы из каталога, где он лежит.
-        let result = self
-            .run_script_with_env(&install_script, &[("BASE", &base)])
-            .await?;
-        Ok(result)
+        self.run_script_with_env(&install_script, &[("BASE", &base)])
+            .await
     }
 
     /// Удаление zapret2 (используется из инструмента "zapret_uninstall").
     async fn uninstall(&self) -> Result<String, String> {
-        let uninstall_script = self.base.join("uninstall.sh");
+        let base_dir = self.base();
+        let uninstall_script = base_dir.join("uninstall.sh");
         if !uninstall_script.is_file() {
             return Err("uninstall.sh не найден (zapret2 уже удалён?)".to_string());
         }
-        let base = self.base.display().to_string();
+        let base = base_dir.display().to_string();
         let result = self
             .run_script_with_env(&uninstall_script, &[("BASE", &base)])
             .await?;
@@ -221,8 +233,12 @@ impl Zapret {
                 "zapret2 уже выключен".to_string()
             });
         }
-        let script = self.base.join(if want { "start.sh" } else { "stop.sh" });
-        let base = self.base.display().to_string();
+        let base_dir = self.base();
+        let script = base_dir.join(if want { "start.sh" } else { "stop.sh" });
+        if !script.is_file() {
+            return Err(format!("не найден скрипт {}", script.display()));
+        }
+        let base = base_dir.display().to_string();
         self.run_script_with_env(&script, &[("BASE", &base)]).await?;
         Ok(if want {
             "zapret2 включён".to_string()
@@ -232,11 +248,23 @@ impl Zapret {
     }
 
     /// Обрабатывает голосовую/быструю команду. Null — не наша фраза.
+    /// У ядра таймаут на `command` равен 2 с, поэтому первичную установку запускаем в фоне.
     async fn handle_command(&self, text: &str) -> Value {
         let t = text.trim();
         match t {
             "включи запрет" | "включи обход" | "включи обход блокировок" | "запет включи"
             | "запрет включи" => {
+                if !self.is_installed() {
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.set_running(true).await {
+                            eprintln!("[zapret] фоновая установка не удалась: {e}");
+                        }
+                    });
+                    return Value::String(
+                        "Устанавливаю и включаю zapret2 в фоне, подождите около минуты".to_string(),
+                    );
+                }
                 Value::String(self.set_running(true).await.unwrap_or_else(err_msg))
             }
             "выключи запрет" | "выключи обход" | "выключи обход блокировок" | "запет выключи"
@@ -251,12 +279,23 @@ impl Zapret {
         match name {
             "set_zapret" => {
                 let enabled = params["enabled"].as_bool().unwrap_or(false);
+                if enabled && !self.is_installed() {
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.set_running(true).await {
+                            eprintln!("[zapret] фоновая установка не удалась: {e}");
+                        }
+                    });
+                    return Value::String(
+                        "Начал установку и запуск zapret2 в фоне, это займёт около минуты".to_string(),
+                    );
+                }
                 Value::String(self.set_running(enabled).await.unwrap_or_else(err_msg))
             }
             "zapret_status" => Value::String(if self.is_running().await {
                 format!(
                     "zapret2 установлен и обход включён (каталог {})",
-                    self.base.display()
+                    self.base().display()
                 )
             } else {
                 "zapret2 не установлен или обход выключен".to_string()
@@ -277,6 +316,11 @@ impl Plugin for Zapret {
             .get(SETTING_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let new_base = parse_base(&settings);
+        {
+            let mut st = self.state.lock().unwrap();
+            st.base = new_base;
+        }
         eprintln!("[zapret] панель изменила enabled -> {}", want);
         // Панельный тумблер. Синхронизируем zapret асинхронно в фоне.
         let this = self.clone();
@@ -288,44 +332,39 @@ impl Plugin for Zapret {
     }
 
     fn tools(&self) -> Vec<Value> {
+        // Ядро YaJarvis ожидает плоскую схему инструмента: type/name/description/parameters на верхнем уровне.
         vec![
             json!({
                 "type": "function",
-                "function": {
-                    "name": "set_zapret",
-                    "description": "Включить или выключить обход DPI (zapret2) на этой Яндекс Станции. При включении автоматически установит zapret2, если его ещё нет. Вызывается по просьбе пользователя.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "enabled": {
-                                "type": "boolean",
-                                "description": "true — включить обход, false — выключить"
-                            }
-                        },
-                        "required": ["enabled"]
-                    }
+                "name": "set_zapret",
+                "description": "Включить или выключить обход DPI (zapret2) на этой Яндекс Станции. При включении автоматически установит zapret2, если его ещё нет. Вызывается по просьбе пользователя.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "true — включить обход, false — выключить"
+                        }
+                    },
+                    "required": ["enabled"]
                 }
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "zapret_status",
-                    "description": "Сообщает, установлен ли zapret2 и включён ли обход DPI на Станции.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                "name": "zapret_status",
+                "description": "Сообщает, установлен ли zapret2 и включён ли обход DPI на Станции.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
                 }
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "zapret_uninstall",
-                    "description": "Полностью удаляет zapret2 со Станции (останавливает обход и убирает автозапуск).",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                "name": "zapret_uninstall",
+                "description": "Полностью удаляет zapret2 со Станции (останавливает обход и убирает автозапуск).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
                 }
             }),
         ]
@@ -333,8 +372,9 @@ impl Plugin for Zapret {
 
     fn request(&self, method: &str, params: Value) -> Response<'_> {
         let this = self.clone();
+        let method = method.to_owned();
         Box::pin(async move {
-            match method {
+            match method.as_str() {
                 "command" => Ok(this
                     .handle_command(params.as_str().unwrap_or(""))
                     .await),

@@ -8,7 +8,7 @@
   "arch": "arm64",
   "api": 1,
   "category": "system",
-  "icon": "network",
+  "icon": "shield",
   "main": "zapret-plugin",
   "provides": ["tools", "commands"],
   "min_core": "0.10.0",
