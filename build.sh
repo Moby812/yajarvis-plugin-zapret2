@@ -39,9 +39,10 @@ build_one() {
     rm -rf "$out_dir"
     mkdir -p "$out_dir"
     cp "target/$target/release/$BIN" "$out_dir/$BIN"
-    cp plugin.json "$out_dir/plugin.json"
+    sed "s/\"arch\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"arch\": \"$arch\"/" plugin.json > "$out_dir/plugin.json"
 
     echo ">> Упаковка $zipname ..."
+    rm -f "../../$zipname"
     (cd "$out_dir" && zip -q -r "../../$zipname" "$BIN" plugin.json)
     echo ">> Готово: $zipname"
 }
