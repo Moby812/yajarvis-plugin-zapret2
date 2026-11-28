@@ -1,7 +1,7 @@
 {
-  "id": "zapret",
+  "id": "yajarvis-zapret2",
   "name": "Zapret (обход DPI)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Устанавливает zapret2 (обход DPI-блокировок YouTube, Discord и др.) прямо на Станцию и включает/выключает его по команде или из панели. Требует root и интернет с колонки.",
   "author": "Moby812",
   "kind": "rust",
